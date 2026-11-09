@@ -16,6 +16,7 @@ import {
   downloadError,
   failedStatus,
   hostOf,
+  NonRetryableError,
   redirectedHost,
   retryDownload
 } from './download-retry.js'
@@ -32,6 +33,12 @@ import { selectMiseRelease } from './release-index.js'
 import { toolVersionOutputs } from './tool-versions.js'
 import { buildInstallCommand } from './install-args.js'
 import { parseManagedPaths, selectPathAdditions } from './managed-paths.js'
+import {
+  type DownloadTarget,
+  curlUserConfig,
+  parseUrlReplacements,
+  withUrlReplacements
+} from './url-replacements.js'
 
 // Default cache key template
 const DEFAULT_CACHE_KEY_TEMPLATE =
@@ -48,6 +55,9 @@ const verifiedShasums = new Map<string, string>()
 
 type DownloadTool = 'curl' | 'wget'
 let cachedDownloadTool: DownloadTool | undefined
+let urlReplacementRules: [string, string][] | undefined | null = null
+const urlReplacementLog = { warning: core.warning, setSecret: core.setSecret }
+
 class MiseIntegrityMismatchError extends Error {}
 
 async function run(): Promise<void> {
@@ -890,18 +900,31 @@ interface DownloadResponse {
  * `--write-out`; wget through `--server-response`, which prints each
  * response's status line to stderr. wget gets one try because the retry loop
  * owns the policy. With `filePath` the body goes to that file (replacing any
- * partial one), otherwise it is returned.
+ * partial one), otherwise it is returned. Credentials from a
+ * `MISE_URL_REPLACEMENTS` rewrite reach curl on stdin, never on the command
+ * line.
  */
 async function requestOnce(
-  url: string,
+  target: DownloadTarget,
   filePath?: string
 ): Promise<DownloadResponse> {
+  const { url, credentials } = target
   const tool = await getDownloadTool()
-  const opts = { silent: true, ignoreReturnCode: true }
+  if (credentials && tool !== 'curl') {
+    throw new NonRetryableError(
+      'the replacement URL has credentials, which only curl can receive off the command line; install curl'
+    )
+  }
+  const opts = {
+    silent: true,
+    ignoreReturnCode: true,
+    ...(credentials ? { input: Buffer.from(curlUserConfig(credentials)) } : {})
+  }
   if (tool === 'curl') {
     const rsp = await exec.getExecOutput(
       'curl',
       [
+        ...(credentials ? ['-K', '-'] : []),
         '-sSL',
         '-w',
         '\n%{http_code} %{url_effective}',
@@ -945,34 +968,62 @@ async function requestOnce(
   }
 }
 
+function urlReplacements(): [string, string][] | undefined {
+  if (urlReplacementRules === null) {
+    urlReplacementRules = parseUrlReplacements(
+      process.env.MISE_URL_REPLACEMENTS,
+      urlReplacementLog
+    )
+  }
+  return urlReplacementRules
+}
+
+// The mirror gets one retry; then the original URL gets the full policy, so a
+// mirror outage costs seconds, not the minute of backoff.
+const MIRROR_RETRIES = 1
+
 /**
- * Download `url` with retries (see download-retry.ts) and return the body, or
- * write it to `filePath` and return an empty string. With `notFoundOk`, an
- * HTTP 404 returns undefined instead of failing.
+ * Download `url`, or its `MISE_URL_REPLACEMENTS` rewrite, with retries (see
+ * download-retry.ts) and return the body, or write it to `filePath` and return
+ * an empty string. With `notFoundOk`, an HTTP 404 from the original URL returns
+ * undefined instead of failing; a mirror that lacks the file says nothing about
+ * the release, so its 404 falls back to the original URL.
  */
 async function download(
   url: string,
   opts: { filePath?: string; notFoundOk?: boolean } = {}
 ): Promise<string | undefined> {
-  return retryDownload(
-    async () => {
-      const rsp = await requestOnce(url, opts.filePath)
-      if (opts.notFoundOk && rsp.status === 404) return undefined
-      const ok =
-        rsp.exitCode === 0 &&
-        (rsp.status === undefined || (rsp.status >= 200 && rsp.status < 300))
-      if (ok) return rsp.body
-      if (opts.filePath) await io.rmRF(opts.filePath)
-      throw downloadError({
-        url,
-        status: failedStatus(rsp.status, rsp.exitCode),
-        host: rsp.host,
-        tool: rsp.tool,
-        exitCode: rsp.exitCode,
-        localError: rsp.localError
-      })
-    },
-    { onRetry: core.warning }
+  return withUrlReplacements(
+    url,
+    urlReplacements(),
+    async (target, mirrored) =>
+      retryDownload(
+        async () => {
+          const rsp = await requestOnce(target, opts.filePath)
+          if (opts.notFoundOk && !mirrored && rsp.status === 404) {
+            return undefined
+          }
+          const ok =
+            rsp.exitCode === 0 &&
+            (rsp.status === undefined ||
+              (rsp.status >= 200 && rsp.status < 300))
+          if (ok) return rsp.body
+          if (opts.filePath) await io.rmRF(opts.filePath)
+          throw downloadError({
+            url: target.url,
+            status: failedStatus(rsp.status, rsp.exitCode),
+            host: rsp.host,
+            tool: rsp.tool,
+            exitCode: rsp.exitCode,
+            localError: rsp.localError
+          })
+        },
+        {
+          onRetry: core.warning,
+          ...(mirrored ? { retries: MIRROR_RETRIES } : {})
+        }
+      ),
+    urlReplacementLog
   )
 }
 

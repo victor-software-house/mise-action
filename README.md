@@ -393,6 +393,25 @@ When a repo mise lock file is present, the action automatically runs
 `bootstrap: true`; use `bootstrap_skip` and `bootstrap_args` for bootstrap
 customization.
 
+## Download mise through a mirror
+
+The action downloads mise, its signed checksums and its packslip through the
+[`MISE_URL_REPLACEMENTS`](https://mise.jdx.dev/url-replacements.html) rules
+that mise itself uses, so one setting routes both through the mirror:
+
+```yaml
+- uses: jdx/mise-action@v4
+  env:
+    MISE_URL_REPLACEMENTS: '{"https://github.com/": "https://mirror.example.com/github/"}'
+```
+
+The action applies plain keys as mise does and skips `regex:` keys. Every
+download is still verified against mise's signatures. Credentials in a
+replacement URL are masked in the log and passed to curl on stdin, never on its
+command line, so they need curl on the runner. When a download through the
+mirror fails after one retry, the action warns and downloads from the original
+URL with the full retry policy.
+
 ## Alternative Installation
 
 Alternatively, mise is easy to use in GitHub Actions even without this:
