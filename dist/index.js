@@ -138995,6 +138995,103 @@ function selectPathAdditions(managedPaths, derive) {
     return managedPaths ?? derive();
 }
 
+/**
+ * Apply mise's `url_replacements` rules, read from `MISE_URL_REPLACEMENTS`, to
+ * the action's own downloads, so mise itself comes from the same mirror that
+ * mise later uses for tools.
+ */
+/**
+ * The rules in `MISE_URL_REPLACEMENTS`, in order, or undefined when it is
+ * unset. A value that is not a JSON object of strings is ignored with a
+ * warning, so a bad setting never blocks the download from GitHub.
+ */
+function parseUrlReplacements(json, log) {
+    if (!json)
+        return undefined;
+    let rules;
+    try {
+        rules = JSON.parse(json);
+    }
+    catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warning(`Ignoring MISE_URL_REPLACEMENTS: not valid JSON (${reason})`);
+        return undefined;
+    }
+    if (typeof rules !== 'object' ||
+        rules === null ||
+        Array.isArray(rules) ||
+        !Object.values(rules).every(v => typeof v === 'string')) {
+        log.warning('Ignoring MISE_URL_REPLACEMENTS: expected a JSON object of string replacements');
+        return undefined;
+    }
+    return Object.entries(rules);
+}
+/**
+ * Rewrite `url` as mise does: rules apply in order, a plain key replaces every
+ * occurrence anywhere in the URL, and the first rule that turns the URL into a
+ * different valid URL wins. `regex:` rules are skipped; the action only
+ * supports plain keys.
+ */
+function replaceUrl(url, rules) {
+    for (const [pattern, replacement] of rules) {
+        if (pattern.startsWith('regex:') || !url.includes(pattern))
+            continue;
+        const replaced = url.split(pattern).join(replacement);
+        if (replaced !== url && URL.canParse(replaced))
+            return replaced;
+    }
+    return url;
+}
+/** Take the userinfo out of `url`, so it never reaches a command line or log. */
+function downloadTarget(url) {
+    const parsed = new URL(url);
+    if (!parsed.username && !parsed.password)
+        return { url };
+    const credentials = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
+    parsed.username = '';
+    parsed.password = '';
+    return { url: parsed.toString(), credentials };
+}
+/** A curl config, read with `curl -K -`, that passes `credentials` on stdin. */
+function curlUserConfig(credentials) {
+    const quoted = credentials
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n');
+    return `user = "${quoted}"\n`;
+}
+/**
+ * Fetch `url` through the first matching rule. When that fails, warn and fetch
+ * the original URL instead, so a mirror outage never fails the run. `fetch`
+ * gets `mirrored` so it can treat a missing file on the mirror as a failure.
+ */
+async function withUrlReplacements(url, rules, fetch, log) {
+    const replaced = rules ? replaceUrl(url, rules) : url;
+    if (replaced === url)
+        return fetch({ url }, false);
+    const target = downloadTarget(replaced);
+    try {
+        if (target.credentials) {
+            log.setSecret(target.credentials);
+            // A token passed as the user name alone has an empty password.
+            const sep = target.credentials.indexOf(':');
+            log.setSecret(target.credentials.slice(sep + 1) || target.credentials.slice(0, sep));
+            // mise refuses the same downgrade.
+            if (new URL(url).protocol === 'https:' &&
+                new URL(target.url).protocol === 'http:') {
+                throw new Error('refusing to send credentials over plain HTTP');
+            }
+        }
+        return await fetch(target, true);
+    }
+    catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warning(`Could not download ${target.url} through MISE_URL_REPLACEMENTS: ${reason}. Falling back to ${url}.`);
+        return fetch({ url }, false);
+    }
+}
+
 // Default cache key template
 const DEFAULT_CACHE_KEY_TEMPLATE = '{{cache_key_prefix}}-{{platform}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}{{#if bootstrap_hash}}-{{bootstrap_hash}}{{/if}}{{#if plugins_hash}}-{{plugins_hash}}{{/if}}{{#if cache_period}}-p{{cache_period}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}';
 const ROOT_MISE_LOCK_FILE_PATTERNS = [/^\.?mise(?:\.[^.]+)?\.lock$/];
@@ -139007,6 +139104,8 @@ const verifiedShasums = new Map();
 let cachedDownloadTool;
 const DOWNLOAD_RETRIES = 5;
 const DOWNLOAD_RETRY_DELAY_MS = 2000;
+let urlReplacementRules = null;
+const urlReplacementLog = { warning: warning, setSecret: setSecret };
 class NonRetryableError extends Error {
 }
 class MiseIntegrityMismatchError extends Error {
@@ -139661,6 +139760,31 @@ async function getDownloadTool() {
     info(`Using ${cachedDownloadTool} to download mise`);
     return cachedDownloadTool;
 }
+function urlReplacements() {
+    if (urlReplacementRules === null) {
+        urlReplacementRules = parseUrlReplacements(process.env.MISE_URL_REPLACEMENTS, urlReplacementLog);
+    }
+    return urlReplacementRules;
+}
+/**
+ * Fetch `url`, or its `MISE_URL_REPLACEMENTS` rewrite, with `tool`. Credentials
+ * from the rewrite reach curl on stdin, never on the command line.
+ */
+async function download(url, fetch) {
+    const tool = await getDownloadTool();
+    return withUrlReplacements(url, urlReplacements(), async (target, mirrored) => {
+        if (!target.credentials) {
+            return fetch(tool, target, { args: [], options: {} }, mirrored);
+        }
+        if (tool !== 'curl') {
+            throw new Error('the replacement URL has credentials, which only curl can receive off the command line; install curl');
+        }
+        return fetch(tool, target, {
+            args: ['-K', '-'],
+            options: { input: Buffer.from(curlUserConfig(target.credentials)) }
+        }, mirrored);
+    }, urlReplacementLog);
+}
 async function retryDownload(fn) {
     for (let retry = 0;; retry++) {
         try {
@@ -139675,33 +139799,29 @@ async function retryDownload(fn) {
     }
 }
 async function downloadToFile(url, filePath) {
-    const tool = await getDownloadTool();
-    await retryDownload(async () => {
+    await download(url, (tool, target, curl) => retryDownload(async () => {
         if (tool === 'curl') {
-            await exec('curl', ['-fsSL', url, '--output', filePath]);
+            await exec('curl', [...curl.args, '-fsSL', target.url, '--output', filePath], curl.options);
         }
         else {
-            await exec('wget', ['-qO', filePath, url]);
+            await exec('wget', ['-qO', filePath, target.url]);
         }
-    });
+    }));
 }
 async function downloadText(url) {
     return (await downloadRawText(url)).trim();
 }
 async function downloadRawText(url) {
-    const tool = await getDownloadTool();
-    return retryDownload(async () => {
+    return download(url, (tool, target, curl) => retryDownload(async () => {
         if (tool === 'curl') {
-            const rsp = await getExecOutput('curl', ['-fsSL', url], {
-                silent: true
-            });
+            const rsp = await getExecOutput('curl', [...curl.args, '-fsSL', target.url], { ...curl.options, silent: true });
             return rsp.stdout;
         }
-        const rsp = await getExecOutput('wget', ['-qO-', url], {
+        const rsp = await getExecOutput('wget', ['-qO-', target.url], {
             silent: true
         });
         return rsp.stdout;
-    });
+    }));
 }
 async function withDownloadedMiseAsset(url, version, assetName, verifyAssetName, fn) {
     const tempDir = await fs.promises.mkdtemp(path$2.join(os.tmpdir(), 'mise-action-'));
@@ -139723,31 +139843,29 @@ async function withDownloadedMiseAsset(url, version, assetName, verifyAssetName,
  * failure throws, so a missing packslip is the only thing that falls back.
  */
 async function fetchPackslipBundle(url) {
-    const tool = await getDownloadTool();
-    return retryDownload(async () => {
+    return download(url, (tool, target, curl, mirrored) => retryDownload(async () => {
         const rsp = tool === 'curl'
-            ? await getExecOutput('curl', ['-sSL', '-w', '\n%{http_code}', url], { silent: true, ignoreReturnCode: true })
-            : await getExecOutput('wget', ['-qO-', '--server-response', url], {
-                silent: true,
-                ignoreReturnCode: true
-            });
+            ? await getExecOutput('curl', [...curl.args, '-sSL', '-w', '\n%{http_code}', target.url], { ...curl.options, silent: true, ignoreReturnCode: true })
+            : await getExecOutput('wget', ['-qO-', '--server-response', target.url], { silent: true, ignoreReturnCode: true });
+        // A mirror that lacks the bundle says nothing about the release, so
+        // only the original URL's 404 means there is no packslip.
         if (tool === 'curl') {
             const nl = rsp.stdout.lastIndexOf('\n');
             const status = Number(rsp.stdout.slice(nl + 1));
-            if (status === 404)
+            if (status === 404 && !mirrored)
                 return undefined;
             if (rsp.exitCode === 0 && status >= 200 && status < 300) {
                 return rsp.stdout.slice(0, nl);
             }
-            throwDownloadStatus(url, status || undefined, rsp.stderr);
+            throwDownloadStatus(target.url, status || undefined, rsp.stderr);
         }
         if (rsp.exitCode === 0)
             return rsp.stdout;
-        if (/HTTP\/\S+\s+404\b/.test(rsp.stderr))
+        if (/HTTP\/\S+\s+404\b/.test(rsp.stderr) && !mirrored)
             return undefined;
         const m = /HTTP\/\S+\s+(\d{3})/.exec(rsp.stderr);
-        throwDownloadStatus(url, m ? Number(m[1]) : undefined, rsp.stderr);
-    });
+        throwDownloadStatus(target.url, m ? Number(m[1]) : undefined, rsp.stderr);
+    }));
 }
 // Permanent client errors will not change on retry; 408 and 429 might.
 function throwDownloadStatus(url, status, stderr) {

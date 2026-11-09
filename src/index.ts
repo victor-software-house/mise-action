@@ -25,6 +25,12 @@ import { selectMiseRelease } from './release-index.js'
 import { toolVersionOutputs } from './tool-versions.js'
 import { buildInstallCommand } from './install-args.js'
 import { parseManagedPaths, selectPathAdditions } from './managed-paths.js'
+import {
+  type DownloadTarget,
+  curlUserConfig,
+  parseUrlReplacements,
+  withUrlReplacements
+} from './url-replacements.js'
 
 // Default cache key template
 const DEFAULT_CACHE_KEY_TEMPLATE =
@@ -43,6 +49,9 @@ type DownloadTool = 'curl' | 'wget'
 let cachedDownloadTool: DownloadTool | undefined
 const DOWNLOAD_RETRIES = 5
 const DOWNLOAD_RETRY_DELAY_MS = 2000
+
+let urlReplacementRules: [string, string][] | undefined | null = null
+const urlReplacementLog = { warning: core.warning, setSecret: core.setSecret }
 
 class NonRetryableError extends Error {}
 class MiseIntegrityMismatchError extends Error {}
@@ -870,6 +879,56 @@ async function getDownloadTool(): Promise<DownloadTool> {
   return cachedDownloadTool
 }
 
+function urlReplacements(): [string, string][] | undefined {
+  if (urlReplacementRules === null) {
+    urlReplacementRules = parseUrlReplacements(
+      process.env.MISE_URL_REPLACEMENTS,
+      urlReplacementLog
+    )
+  }
+  return urlReplacementRules
+}
+
+/**
+ * Fetch `url`, or its `MISE_URL_REPLACEMENTS` rewrite, with `tool`. Credentials
+ * from the rewrite reach curl on stdin, never on the command line.
+ */
+async function download<T>(
+  url: string,
+  fetch: (
+    tool: DownloadTool,
+    target: DownloadTarget,
+    curl: { args: string[]; options: exec.ExecOptions },
+    mirrored: boolean
+  ) => Promise<T>
+): Promise<T> {
+  const tool = await getDownloadTool()
+  return withUrlReplacements(
+    url,
+    urlReplacements(),
+    async (target, mirrored) => {
+      if (!target.credentials) {
+        return fetch(tool, target, { args: [], options: {} }, mirrored)
+      }
+      if (tool !== 'curl') {
+        throw new Error(
+          'the replacement URL has credentials, which only curl can receive off the command line; install curl'
+        )
+      }
+      return fetch(
+        tool,
+        target,
+        {
+          args: ['-K', '-'],
+          options: { input: Buffer.from(curlUserConfig(target.credentials)) }
+        },
+        mirrored
+      )
+    },
+    urlReplacementLog
+  )
+}
+
 async function retryDownload<T>(fn: () => Promise<T>): Promise<T> {
   for (let retry = 0; ; retry++) {
     try {
@@ -886,14 +945,19 @@ async function retryDownload<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function downloadToFile(url: string, filePath: string): Promise<void> {
-  const tool = await getDownloadTool()
-  await retryDownload(async () => {
-    if (tool === 'curl') {
-      await exec.exec('curl', ['-fsSL', url, '--output', filePath])
-    } else {
-      await exec.exec('wget', ['-qO', filePath, url])
-    }
-  })
+  await download(url, (tool, target, curl) =>
+    retryDownload(async () => {
+      if (tool === 'curl') {
+        await exec.exec(
+          'curl',
+          [...curl.args, '-fsSL', target.url, '--output', filePath],
+          curl.options
+        )
+      } else {
+        await exec.exec('wget', ['-qO', filePath, target.url])
+      }
+    })
+  )
 }
 
 async function downloadText(url: string): Promise<string> {
@@ -901,19 +965,22 @@ async function downloadText(url: string): Promise<string> {
 }
 
 async function downloadRawText(url: string): Promise<string> {
-  const tool = await getDownloadTool()
-  return retryDownload(async () => {
-    if (tool === 'curl') {
-      const rsp = await exec.getExecOutput('curl', ['-fsSL', url], {
+  return download(url, (tool, target, curl) =>
+    retryDownload(async () => {
+      if (tool === 'curl') {
+        const rsp = await exec.getExecOutput(
+          'curl',
+          [...curl.args, '-fsSL', target.url],
+          { ...curl.options, silent: true }
+        )
+        return rsp.stdout
+      }
+      const rsp = await exec.getExecOutput('wget', ['-qO-', target.url], {
         silent: true
       })
       return rsp.stdout
-    }
-    const rsp = await exec.getExecOutput('wget', ['-qO-', url], {
-      silent: true
     })
-    return rsp.stdout
-  })
+  )
 }
 
 async function withDownloadedMiseAsset(
@@ -944,33 +1011,37 @@ async function withDownloadedMiseAsset(
  * failure throws, so a missing packslip is the only thing that falls back.
  */
 async function fetchPackslipBundle(url: string): Promise<string | undefined> {
-  const tool = await getDownloadTool()
-  return retryDownload(async () => {
-    const rsp =
-      tool === 'curl'
-        ? await exec.getExecOutput(
-            'curl',
-            ['-sSL', '-w', '\n%{http_code}', url],
-            { silent: true, ignoreReturnCode: true }
-          )
-        : await exec.getExecOutput('wget', ['-qO-', '--server-response', url], {
-            silent: true,
-            ignoreReturnCode: true
-          })
-    if (tool === 'curl') {
-      const nl = rsp.stdout.lastIndexOf('\n')
-      const status = Number(rsp.stdout.slice(nl + 1))
-      if (status === 404) return undefined
-      if (rsp.exitCode === 0 && status >= 200 && status < 300) {
-        return rsp.stdout.slice(0, nl)
+  return download(url, (tool, target, curl, mirrored) =>
+    retryDownload(async () => {
+      const rsp =
+        tool === 'curl'
+          ? await exec.getExecOutput(
+              'curl',
+              [...curl.args, '-sSL', '-w', '\n%{http_code}', target.url],
+              { ...curl.options, silent: true, ignoreReturnCode: true }
+            )
+          : await exec.getExecOutput(
+              'wget',
+              ['-qO-', '--server-response', target.url],
+              { silent: true, ignoreReturnCode: true }
+            )
+      // A mirror that lacks the bundle says nothing about the release, so
+      // only the original URL's 404 means there is no packslip.
+      if (tool === 'curl') {
+        const nl = rsp.stdout.lastIndexOf('\n')
+        const status = Number(rsp.stdout.slice(nl + 1))
+        if (status === 404 && !mirrored) return undefined
+        if (rsp.exitCode === 0 && status >= 200 && status < 300) {
+          return rsp.stdout.slice(0, nl)
+        }
+        throwDownloadStatus(target.url, status || undefined, rsp.stderr)
       }
-      throwDownloadStatus(url, status || undefined, rsp.stderr)
-    }
-    if (rsp.exitCode === 0) return rsp.stdout
-    if (/HTTP\/\S+\s+404\b/.test(rsp.stderr)) return undefined
-    const m = /HTTP\/\S+\s+(\d{3})/.exec(rsp.stderr)
-    throwDownloadStatus(url, m ? Number(m[1]) : undefined, rsp.stderr)
-  })
+      if (rsp.exitCode === 0) return rsp.stdout
+      if (/HTTP\/\S+\s+404\b/.test(rsp.stderr) && !mirrored) return undefined
+      const m = /HTTP\/\S+\s+(\d{3})/.exec(rsp.stderr)
+      throwDownloadStatus(target.url, m ? Number(m[1]) : undefined, rsp.stderr)
+    })
+  )
 }
 
 // Permanent client errors will not change on retry; 408 and 429 might.
