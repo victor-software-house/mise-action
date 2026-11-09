@@ -1,0 +1,824 @@
+mise-download-url-replacements
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Download mise, its signed checksums and its packslip through the MISE_URL_REPLACEMENTS rules that mise itself honors, so CI fetches everything through one mirror. Plain keys follow mise's rule: in order, every occurrence, first rule that yields a different valid URL wins; regex: keys are skipped. Credentials in a rewritten URL reach curl on stdin, never argv, and a failed mirror download falls back to the original URL.
+Upstream-Status: not-submitted
+Drop-When: Upstream jdx/mise-action applies MISE_URL_REPLACEMENTS to its own downloads with credentials kept off the command line.
+---
+ .github/workflows/test.yml        |   38 +++++
+ README.md                         |   19 +++
+ dist/index.js                     |  Bin
+ dist/index.js.map                 |  Bin
+ scripts/url-replacements.test.mjs |  273 +++++++++++++++++++++++++++++++++++++
+ src/index.ts                      |  101 ++++++++++----
+ src/url-replacements.ts           |  123 +++++++++++++++++
+ 7 files changed, 529 insertions(+), 25 deletions(-)
+ create mode 100644 scripts/url-replacements.test.mjs
+ create mode 100644 src/url-replacements.ts
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 439e36a1e3a6512e99fd769a0a3fbe02abcfa209..6051ac07109afc8c1910ef33e9df32ecd92b2836 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -489,6 +489,44 @@ jobs:
+         shell: bash
+         run: test "$(cat "$MISE_ACTION_CURL_ATTEMPTS")" = 3
+ 
++  url_replacements:
++    timeout-minutes: 10
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++      - name: Record curl command lines
++        shell: bash
++        run: |
++          real_curl="$(command -v curl)"
++          mock_bin="$RUNNER_TEMP/mock-bin"
++          mkdir -p "$mock_bin"
++          cat > "$mock_bin/curl" <<EOF
++          #!/usr/bin/env bash
++          printf '%s\n' "\$*" >> "\$MISE_ACTION_CURL_LOG"
++          exec "$real_curl" "\$@"
++          EOF
++          chmod +x "$mock_bin/curl"
++          echo "$mock_bin" >> "$GITHUB_PATH"
++          echo "MISE_ACTION_CURL_LOG=$RUNNER_TEMP/curl-log" >> "$GITHUB_ENV"
++      - name: Setup mise through an unreachable mirror
++        uses: $/
++        env:
++          MISE_URL_REPLACEMENTS: '{"https://github.com/": "https://ci:url-replacements-test-secret@mirror.invalid/github/"}'
++        with:
++          cache: false
++          install: false
++          mise_dir: ${{ runner.temp }}/mise-url-replacements
++          version: 2026.11.5
++      - run: mise --version
++      - name: Check the mirror was tried without credentials on the command line
++        shell: bash
++        run: |
++          grep -q 'https://mirror.invalid/github/jdx/mise/releases/download/v2026.11.5/mise-v2026.11.5-' "$MISE_ACTION_CURL_LOG"
++          grep -q 'https://mirror.invalid/github/jdx/mise/releases/download/v2026.11.5/packslip.sigstore.json' "$MISE_ACTION_CURL_LOG"
++          ! grep -q 'url-replacements-test-secret' "$MISE_ACTION_CURL_LOG"
++
+   test-typescript:
+     timeout-minutes: 10
+     name: TypeScript Tests
+diff --git a/README.md b/README.md
+index 136999028bdb5b9d4383e1158d7cdc79e13f6d41..fb7cecf5cd25fdc614ce3529506cec41bb33cc72 100644
+--- a/README.md
++++ b/README.md
+@@ -393,6 +393,25 @@ When a repo mise lock file is present, the action automatically runs
+ `bootstrap: true`; use `bootstrap_skip` and `bootstrap_args` for bootstrap
+ customization.
+ 
++## Download mise through a mirror
++
++The action downloads mise, its signed checksums and its packslip through the
++[`MISE_URL_REPLACEMENTS`](https://mise.jdx.dev/url-replacements.html) rules
++that mise itself uses, so one setting routes both through the mirror:
++
++```yaml
++- uses: jdx/mise-action@v4
++  env:
++    MISE_URL_REPLACEMENTS: '{"https://github.com/": "https://mirror.example.com/github/"}'
++```
++
++The action applies plain keys as mise does and skips `regex:` keys. Every
++download is still verified against mise's signatures. Credentials in a
++replacement URL are masked in the log and passed to curl on stdin, never on its
++command line, so they need curl on the runner. When a download through the
++mirror fails after one retry, the action warns and downloads from the original
++URL with the full retry policy.
++
+ ## Alternative Installation
+ 
+ Alternatively, mise is easy to use in GitHub Actions even without this:
+diff --git a/dist/index.js b/dist/index.js
+index 11b7c8a9be4cb3a1e3fad81bc2be2e0c6073c540..0c7a1e8aefc14d0df05c0de318dbefa5f2d57a03 100644
+GIT binary patch
+delta 4694
+zcmai1O>7j&6;@y|_CUbK9*lvt%YV#_8MkdhlFfL%;Po0XxB-ogRuN{Ic2CVr<92t`
+z)ot&{%ubMMFIhzjSer8JiBl3Kia11KBSleIDLF)u0y#zbQ}z($l1(o8QKB63UUm2U
+zc!8aRJ=0bF-mCY%?|ZMl^{Wqe{Ndjp?)V!29N)or@|XB7-okhDR^G;Ad=KBtKhO8^
+z{k)xb@B_S)ckwts$h-L=-op>`Bm5|TnfLNOPIx~b;DdaK5A$O@!IM12NBD7`=A&HU
+zV|<)X@DuzC{3QP({}TT)e}#XAXZR$4l~3{4_$hvxPxIIL41a^q@-zG_KgZ|zd47S<
+z|4@B+q&hMZBO_$mam+GVH5g4WlJi~jx=S5X)9EU;JeDJ_Z&H>fF4gj+;M%Jsr_L?R
+zUcZu^zn-1FJU=}%tIl3rT*#$~XQMr@M2V(*hHZg8d)*>=_+#2y9*i(sIwFS0s97x#
+z-Cm_Eu!^rSZI!|X*R@?Rqj_i!10$y9QJ44(H{+UZn@oY#vDjE}h(&l?21*R;`2oV3
+z?dGYQhJVBtJ2y{sR1Jn+e2Y;}A=6|{Gkq$Z6N3@U_J~H#FI>7v?ByF&_lR8}%ySK^
+z$Z*{#TDD8`WZm#eL_<UCnrp$TJgP>PA!lINgD1qIYjB2T)7Dp*Op?q?J0vDZz*)mP
+z=PxVbLHbbV@hh&GZKy)>2D7a+G3{cCY{UqBi~>pa<I|M5y{o%VjQ_RgrCl-u;=y}r
+zS9g$%DH*%sXfC7DhS>kEIw)QxU9IAmTPLQ^gGD6_IhmWo(_pC2EO16<1M*|!gN!7H
+zHUJb5LM4?;O=1|Sy<XX&kfI=viGQ^BRKq}~rikU6Cb@M>hL1;>c3rKk7)<_8%6+NE
+z_5MpT<%%o`3pXg3#d30uOua@zXYd`YCxWshQc;G`g=t@{pD*!Q=c8{sP+}<Ob4m^z
+zs1qX*9C`SCwSBkvPhqaTiabe8#wrmevvl1xJSsVrBN_{!oVO{<gjm%i_3Eh92-t_8
+zE3_Q>VniMop=Im3@4D2|fnQd6y+mD#Xh-4z8PipGnwP%{hRZzZA^@`IyH)@>*axq8
+zc7WBqQ7C{B%R|&dRdIFQu$V$}E-lixGa>nj2A<f8;W#uuDLn-ICbngkF*4>mj@{;Z
+zEQnudAN6*1g~<XWCqYy|Kp;QjVawsJ-m8x00iOZT4GF!5)RKF~m)m>9{l9hW9SEXG
+zASy^d7*PyMH~l<i$<RVdJU*zB_kW*kMbA2vZi?VO=9q?8+oasE4NKf^>4}dA#0lNz
+zNk0Gw_LF1B@bHSRS(hbMq77jGofGlh;ZM<?JQT0GW>{mgsI8z>P!uNMO~EF%FBJk+
+z6!Z|(&hSFs15@-8$d`tiw~CcA4U3`<Aq7#%3ce*(v!<7enp>nECNF}tZd*)T{9w3M
+zXx|u)zbQ39ayzeJ2o}mG9Hl>e=4gzqgW#oVlyfO!fo#Y_S0?3iH0lu@WDJmCXeJXk
+zKb}6k3-gc{<KLeisLHP(BB8ZPE_iXfXW(F>X(f6CiW03f29P141<ziPlA27V8{;4l
+zAd;yHJ&FMIO-P+pFhE;nFOr&@lg~#lkWuVE&@#X#!#0s?I8Y9N3aXtqtmZ`HyH_A@
+zGtz9b;f=<GdvS8pw^0_R8l&5M+|#*dX=x0?Ni4x<^L9_XZ6N$P0KbmzTv~GB|G}yi
+zKD9tIWXi)V<gjR9bzo>C@K708vLLxN1vx`Ky%g$)S8{E?Sdw@P2)?SpD#|soMj>yO
+zD2f53pr9EhG+Wel)PyQ2pdBPCf)ymbXjqyl=?-l7ps|PTDr~)gVy#F+;7ViiMc0S?
+z<)p0~8Ut`bo`ZL2J{Q6rI7B=s5H?Qe-ORB1ilkte;5g8#&<W_FCL{I5#8b7qisihr
+zt?NO30^NYqNWV=jFaT~uRmh`kA>>q~DqyXyJS;^ri29%a$ej9%C<2SXvh6gHE|Vcy
+zAOhe94J#P<_9R2Wb2Q?Fl#NV_r+<mZMeN>iY=@$Yi{9{I$#$3s7AT<2O9lp%2IPsG
+z|Lo|@z=X2`)s$F<b`*%WM2qCOX4;?~B}}13=&IwD<yPdnczm=Y-c20{>KVp=^3&-f
+zRTP{Tg`hCg&}ou^k>g}SitndQg`36!In+soS;3ZzpRuu^*SWL+K?l*x*$(qGSah{K
+zh3T!~gY~fJIzm$F-R5-PLGkPH{au~W(=Y<4U<wvHH@`EuPwbnYZ4>0b@%>6ddO|Kh
+zZ(|hHwIQX%#=$G-tmhUNFDJyuYh8olo8Rr&Eyj-Zwj2oR9C!c~aecaNOp+<9jY%`M
+zZ|3DN6qTI}ZPeqd09gX6K4*-ojZF$UqnXeKiZCbYD;WCF1{|=Wz&KS)4{Ajp5cvgQ
+ztUUVO5%t?U^CtBW;@SF?lEs+>pn#*-WGnz}^NxAD2<scs+?t8LU|mC$X6j!_<<aFn
+z^_E*AGxdHEjISC>!gH<$z{p?}l3g&+@<@`?q0WTr5Ozm2h7D3^;$U3->5jU$CCIS&
+z`yKUAujJ&mW>G`@r1;+*b*u+5)rbOUjCgM#{ldAc#>F4sosU&7+E$i&ZdqG4=`3D5
+zk_nW^kiU2Vk}8QzYcK`US~5VGar_Az6Y$WbIyKfn<_ZNVmyLaX5~eQZL9ylbs0~!a
+zZ$BE@(`q}Qqfi5J>CX_?Cr>(K;zv(9$t6WmnhtOZ%4ArM?`6pAK2B~5UdNIz=wc~S
+z0oB{6NM#dm-Bqs*ecI^N#OQ?tG_lddHQ0RhS}OhM2Y1z_U9Z#zl4iuPWYiro!_8|F
+zZ{lg&X#Dy!7T}Pw<6mjQC=7G1ty9JnYON{H<V<=StO2y*!8`3;)n_=7?Q@JQLK(wO
+zBl{EzCQ!*O%K<j%L`|Jg?!w|1@S5V-pn>I}Eykpr$xCV28FiaM$r!Byqwrdb*F=1E
+z)v$aR_+gMmLIV(#kaOx>HhU=x_vOXx-0TA6VPZ16CA<;dj)OKYZ>DfN{wyW|1fgHH
+z%Oe>;aZqatoDmaS>Tz*>OC8vWziw}-i4lUDM^28PtlzVn4vqo?_XFJj<1O{&l}XvS
+zYj<$Cdq)>m*~OVwmiJ;gd1%X!5#(yX8WXOAR3;6NAYB6HSxw$>SEKKM-A_JHTgAV&
+z)ZVktodKHb3<yj^Q!HCL2|H*ytToN2;9@8`@2NA9UVQbQI?>%9O({4YyUbC5jGoWL
+zCvPPWZJs8(#lwjMo#J$LBqlC*^tFgzfB`Y|yY>TO|9$mmZP1Tpr&q+&`|592YuX&D
+tM_n{)D@e1NPb4m44+@omyLA&38VE`%aIEH&BG7MtUF~`VIr{l~{|A~nJhcD-
+
+delta 437
+zcmWlTyH8VL9EM|$AfQ%SdQqYHi5E(#g<@5#RuR0^%O}LJno!A6n&3gdb54kw5Qk@T
+z_cu5Yv0Gcy!B`ean2eK?ZvF)(uEx#N@qP0?Pu^dDw?l8gZ--v9hY%Kf>7tu`^w3Km
+z`#Hct!W^QX2vG)z5hp>C!yMr#gA9>km}4l8Gr|c@a*ET8l4gty<77EQjtM5oGsRg7
+zoZ~zfnC2oyE^(O>SGdXy*O+CF>)hZbw<vR)JKW{oC*2xs*D`v`YBzHFrIAOHhz%M0
+zxo^APyt8bleY2WXkE^TpLd9DdQ?KOrdp#jPw{$qH+@N;6qVkMyXJzA`PKx=UAAYXs
+z`7WtRra!q9;7e+~>a8ead!}l;D(%{~r0ROy>Qfmh*Y$`zt?SWPkW_hbaX}R(3!SlV
+z99MSgIwciJ#AU6edt|wxhvi#C&su?3B2Ar-8uwYw^(vn4s#2-cfn|4NDlV;jbU=0*
+uv2J<S)N}HuslUqZNBtwB)|>~yl@~>|UNKJ9c_N$E{Y1y#+g2_8<;{O{Iif89
+
+diff --git a/dist/index.js.map b/dist/index.js.map
+index 239b1954e31e19fd0bbb24628e4d203f1c40c6b4..3127d07b56d5ea285c1b154e040999d832d1c0d8 100644
+GIT binary patch
+delta 4937
+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
+YtMSEk_)4Xp^I(NTM4a-SxoG{r0sENee*gdg
+
+delta 2401
+zcmXBUdtBA^9mny<mz!|}J?cS06c1_`auGDb3kj#=4b#*FL<$qhOO!@Qp{0nI!qni0
+zQ@>@!mvU{a&FSVG*=EO8YiSp0PPaB^wu|kS;aYR8ZS{JuKc270<M)019^c>R_kH{x
+zzjFspCcJj=jfBHbbZtG_)pE4UAPUilK`i3X2iG7TKJ-Nb644L+;l}_B#2^Haguxhs
+zWTapyQZWp}k%kcnA{`?!3Zro?GB5_$AroVfg>2*?7vqqJe2m8gT#o|WfI>{fBuvH>
+z6yZipMKMYc!c7Qc8m40gW?~jfF&j5y4(8$(%)@*vz^&a!yB5yNX^B6#5M?Mw1s0(a
+zi&2H!a67881b1L5YOoBoxD(5<0xPi!ccBh<;~uQW8r+L|+=u(I77cg+526w4upSTL
+zVQj!gG+`5(u^C&i72EI#9z_eb<1y^OPVB<tXhj=5v|~5EhCSGeeXw`}Phvlw!qa#L
+z9dPKxvv>{%@O3<oZ{VBg!ng1OzK!qTAij%3IE?S%`#6Fh;3$5GZoG(NcnLqkk8vC?
+zBZ3q730}dgcnv?r>-ZVoz)76Kn|KRv;~ktv58lPkaR$G@S)9W!@hiNCU*k78kKf_~
+z-p56JfZyTw_yhikOZX6f!k_UM{1t!0N4SiS(TgkiJ3hfb@G1U@tN0f_!@u!4{)7MG
+zfB0f&{5jJGB}$1_Vw6}VPU)juqr@vdrLU5pBr5%s{)%52pbS(7DFG!(8LSLZl9d!?
+zsFJD-Q-&*P$_OQ>q$?wpQOaoLS|vjnqg<zCDr1!_C0of+a+PsPo|3POS0*UeD+S68
+zN})1QnWRisrYJ?qjmlJ|SSe9L%1ugGnWjuvW+*e2SxTugTe(@8qs&!qQRXT0l?BSJ
+z%0i_~DOW0#MM|ZzSgBHOQ*KwPl_km@%2K69S*Fw~cPh)370OCwm2#I-r`)aFqpVie
+zDEBJ$%6-cH%37sCc|dtkX;juJ>y?L;hm{S=Mx{yFq%<p=l`YCvWt;Md@~G0HY*!vr
+zb|^cQUFHz~BGYYF+Go!mX|=)4t46w>Pb*BhJ-neTCvvg7)x7Grhf|x<w6Mlrj6d(U
+zOS>A=Y{`bk6dQcJE-q5}W~(_KW$Op*pW>FLw3&>32O?QEIP@i-?K!(<k_}F(%66Tr
+zlgxP6^Z6_@*Ljg0#@Dw0bgPN%Kiy_l6}xI*z8UB)jBPhtY~Gc!825C4&kV317ww9V
+z3Rk+5TxHqL%&K9w=UC+^>#bcEw7rX6qHElnV@Cgfv7=9sNwC4xw#n|qCrxIQ<}Gx+
+zO><15?X2B0#9rKd$Y;Hex-)IwyoMa>l{Tcg=F7Pz!7WMh%pSM9uHB4$d5C8w_?<tw
+z&D6SrT+c*o{nfG<yF0jjs@t09nHM^yrn7nTD-F3(Qx@1Odyb^IlA0J(Wc{;t4(y1Y
+zX>wfezWHW^I~Hy?OKdQ9Z<6&Ve-Ufn?)faBp$5AX=i3;{d#|FO+cm*6r7<<3aGlM+
+z^vqa0zkFk!YkqOLNwvXoZ)JS-x}9gLQf$Zb6#?7RvM6AK>F@Yl;)-o1%XxL|6uDa9
+znPtXxr?;E_t|=kYB-zf(^^^55pY3%|rP#cL^&|G3sZVy^?2NCD#%KKpSI0$~Cwk^}
+zGpIBao}C>Ig~CdRgs0h>OZ6!(v~sw~?7KL7dMGqq%lR&CjAsh9b(-^PJu}0e2&@P=
+zuh=s_8@X^gw(V3Ar*^8S-OO1OUD!CyeQ+h&jI$-SGS9yM;ieRQOaWI?Ud{b^fd-!~
+Tes_0VB(kU71dc}+RB!weC{hgg
+
+diff --git a/scripts/url-replacements.test.mjs b/scripts/url-replacements.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fa594ae962e8e1c721a41f75749099ea8a5f752
+--- /dev/null
++++ b/scripts/url-replacements.test.mjs
+@@ -0,0 +1,273 @@
++import assert from 'node:assert/strict'
++import { Buffer } from 'node:buffer'
++import { execFile } from 'node:child_process'
++import http from 'node:http'
++import test from 'node:test'
++import { packslipIdentity, verifyAgainstPackslip } from '../src/packslip.ts'
++import {
++  curlUserConfig,
++  downloadTarget,
++  parseUrlReplacements,
++  replaceUrl,
++  withUrlReplacements
++} from '../src/url-replacements.ts'
++
++const asset =
++  'https://github.com/jdx/mise/releases/download/v2026.1.0/mise-v2026.1.0-linux-x64.tar.zst'
++
++function recorder() {
++  const log = { warnings: [], secrets: [] }
++  log.warning = message => log.warnings.push(message)
++  log.setSecret = secret => log.secrets.push(secret)
++  return log
++}
++
++test('reads rules from a JSON object in order', () => {
++  const log = recorder()
++  assert.deepEqual(
++    parseUrlReplacements('{"https://github.com/":"https://a/","x":"y"}', log),
++    [
++      ['https://github.com/', 'https://a/'],
++      ['x', 'y']
++    ]
++  )
++  assert.deepEqual(log.warnings, [])
++})
++
++test('ignores an unset value, and warns about one that is not an object of strings', () => {
++  const log = recorder()
++  assert.equal(parseUrlReplacements(undefined, log), undefined)
++  assert.equal(parseUrlReplacements('', log), undefined)
++  assert.deepEqual(log.warnings, [])
++  for (const bad of ['{', '[]', '"x"', 'null', '{"a":1}']) {
++    assert.equal(parseUrlReplacements(bad, log), undefined, bad)
++  }
++  assert.equal(log.warnings.length, 5)
++})
++
++test('replaces a plain key and keeps the rest of the URL', () => {
++  assert.equal(
++    replaceUrl(asset, [['https://github.com/', 'https://mirror.example/gh/']]),
++    'https://mirror.example/gh/jdx/mise/releases/download/v2026.1.0/mise-v2026.1.0-linux-x64.tar.zst'
++  )
++})
++
++test('replaces every occurrence of a plain key, as mise does', () => {
++  assert.equal(
++    replaceUrl('https://h/v1/a/v1', [['v1', 'v2']]),
++    'https://h/v2/a/v2'
++  )
++})
++
++test('uses the first rule that changes the URL', () => {
++  assert.equal(
++    replaceUrl(asset, [
++      ['https://example.org/', 'https://never/'],
++      ['https://github.com/jdx/', 'https://first/'],
++      ['https://github.com/', 'https://second/']
++    ]),
++    asset.replace('https://github.com/jdx/', 'https://first/')
++  )
++})
++
++test('skips a rule that leaves the URL unchanged or makes it invalid', () => {
++  assert.equal(
++    replaceUrl(asset, [
++      ['https://github.com/', 'https://github.com/'],
++      ['https://', 'not a url '],
++      ['https://github.com/', 'https://mirror/']
++    ]),
++    asset.replace('https://github.com/', 'https://mirror/')
++  )
++})
++
++test('skips regex rules', () => {
++  assert.equal(replaceUrl(asset, [['regex:^https://github\\.com/', 'https://x/']]), asset)
++})
++
++test('takes credentials out of the URL', () => {
++  assert.deepEqual(downloadTarget('https://ci:p%40ss@mirror.example/a'), {
++    url: 'https://mirror.example/a',
++    credentials: 'ci:p@ss'
++  })
++  assert.deepEqual(downloadTarget('https://mirror.example/a'), {
++    url: 'https://mirror.example/a'
++  })
++})
++
++test('curl reads the credentials from its stdin config', async t => {
++  const credentials = 'ci:t"o\\k:en'
++  const server = http.createServer((req, res) => {
++    res.end(req.headers.authorization ?? 'none')
++  })
++  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
++  t.after(() => server.close())
++  const url = `http://127.0.0.1:${server.address().port}/`
++  const got = await new Promise((resolve, reject) => {
++    const child = execFile('curl', ['-K', '-', '-fsS', url], (err, stdout) =>
++      err ? reject(err) : resolve(stdout)
++    )
++    child.stdin.end(curlUserConfig(credentials))
++  })
++  assert.equal(got, `Basic ${Buffer.from(credentials).toString('base64')}`)
++})
++
++test('fetches the original URL when no rule matches', async () => {
++  const log = recorder()
++  const calls = []
++  const got = await withUrlReplacements(
++    asset,
++    [['https://example.org/', 'https://mirror/']],
++    async (target, mirrored) => {
++      calls.push([target, mirrored])
++      return 'ok'
++    },
++    log
++  )
++  assert.equal(got, 'ok')
++  assert.deepEqual(calls, [[{ url: asset }, false]])
++})
++
++test('fetches the mirror with masked credentials kept out of the URL', async () => {
++  const log = recorder()
++  const calls = []
++  await withUrlReplacements(
++    asset,
++    [['https://github.com/', 'https://ci:secret@mirror.example/']],
++    async (target, mirrored) => {
++      calls.push([target, mirrored])
++    },
++    log
++  )
++  assert.deepEqual(calls, [
++    [
++      {
++        url: asset.replace('https://github.com/', 'https://mirror.example/'),
++        credentials: 'ci:secret'
++      },
++      true
++    ]
++  ])
++  assert.deepEqual(log.secrets, ['ci:secret', 'secret'])
++  assert.deepEqual(log.warnings, [])
++})
++
++test('falls back to the original URL with a warning when the mirror fails', async () => {
++  const log = recorder()
++  const calls = []
++  const got = await withUrlReplacements(
++    asset,
++    [['https://github.com/', 'https://ci:secret@mirror.example/']],
++    async (target, mirrored) => {
++      calls.push(target.url)
++      if (mirrored) throw new Error('HTTP 503')
++      return 'from github'
++    },
++    log
++  )
++  assert.equal(got, 'from github')
++  assert.equal(calls.length, 2)
++  assert.equal(calls[1], asset)
++  assert.equal(log.warnings.length, 1)
++  assert.match(log.warnings[0], /HTTP 503/)
++  assert.doesNotMatch(log.warnings[0], /secret/)
++})
++
++test('refuses to send credentials over plain HTTP', async () => {
++  const log = recorder()
++  const calls = []
++  await withUrlReplacements(
++    asset,
++    [['https://github.com/', 'http://ci:secret@mirror.example/']],
++    async (target, mirrored) => {
++      calls.push(mirrored)
++    },
++    log
++  )
++  assert.deepEqual(calls, [false])
++  assert.match(log.warnings[0], /plain HTTP/)
++})
++
++// A fake packslip verifier that pins the release identity and treats the file
++// path as its digest, as in packslip.test.mjs.
++function packslipVerifier(version, asset, digest) {
++  return {
++    async verifyRelease(bundle, options) {
++      assert.equal(bundle, '{}')
++      assert.equal(options.identity, packslipIdentity(version))
++      return {}
++    },
++    findArtifact(statement, name) {
++      assert.equal(name, asset)
++      return { name, sha256: digest }
++    },
++    async verifyFileDigest(path, artifact) {
++      assert.equal(path, artifact.sha256)
++    }
++  }
++}
++
++test('fetches the packslip through the mirror with credentials kept out of the URL', async () => {
++  const version = '2026.11.5'
++  const asset = `mise-v${version}-linux-x64.tar.zst`
++  const log = recorder()
++  const calls = []
++  const verified = await verifyAgainstPackslip(
++    'digest',
++    version,
++    asset,
++    url =>
++      withUrlReplacements(
++        url,
++        [['https://github.com/', 'https://ci:secret@mirror.example/']],
++        async (target, mirrored) => {
++          calls.push([target, mirrored])
++          return '{}'
++        },
++        log
++      ),
++    packslipVerifier(version, asset, 'digest')
++  )
++  assert.equal(verified, true)
++  assert.deepEqual(calls, [
++    [
++      {
++        url: `https://mirror.example/jdx/mise/releases/download/v${version}/packslip.sigstore.json`,
++        credentials: 'ci:secret'
++      },
++      true
++    ]
++  ])
++  assert.deepEqual(log.warnings, [])
++})
++
++test('fetches the packslip from GitHub when the mirror lacks it', async () => {
++  const version = '2026.11.5'
++  const asset = `mise-v${version}-linux-x64.tar.zst`
++  const log = recorder()
++  const urls = []
++  const verified = await verifyAgainstPackslip(
++    'digest',
++    version,
++    asset,
++    url =>
++      withUrlReplacements(
++        url,
++        [['https://github.com/', 'https://mirror.example/']],
++        async (target, mirrored) => {
++          urls.push(target.url)
++          // index.ts treats a mirror 404 as a failure, not as a missing packslip.
++          if (mirrored) throw new Error('HTTP 404')
++          return '{}'
++        },
++        log
++      ),
++    packslipVerifier(version, asset, 'digest')
++  )
++  assert.equal(verified, true)
++  assert.deepEqual(urls, [
++    `https://mirror.example/jdx/mise/releases/download/v${version}/packslip.sigstore.json`,
++    `https://github.com/jdx/mise/releases/download/v${version}/packslip.sigstore.json`
++  ])
++  assert.match(log.warnings[0], /HTTP 404/)
++})
+diff --git a/src/index.ts b/src/index.ts
+index 4196518d3d66efeda36ff1ed55cc475846393ca1..750c918a896b62e049e193cea970849e05a94556 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -16,6 +16,7 @@ import {
+   downloadError,
+   failedStatus,
+   hostOf,
++  NonRetryableError,
+   redirectedHost,
+   retryDownload
+ } from './download-retry.js'
+@@ -32,6 +33,12 @@ import { selectMiseRelease } from './release-index.js'
+ import { toolVersionOutputs } from './tool-versions.js'
+ import { buildInstallCommand } from './install-args.js'
+ import { parseManagedPaths, selectPathAdditions } from './managed-paths.js'
++import {
++  type DownloadTarget,
++  curlUserConfig,
++  parseUrlReplacements,
++  withUrlReplacements
++} from './url-replacements.js'
+ 
+ // Default cache key template
+ const DEFAULT_CACHE_KEY_TEMPLATE =
+@@ -48,6 +55,9 @@ const verifiedShasums = new Map<string, string>()
+ 
+ type DownloadTool = 'curl' | 'wget'
+ let cachedDownloadTool: DownloadTool | undefined
++let urlReplacementRules: [string, string][] | undefined | null = null
++const urlReplacementLog = { warning: core.warning, setSecret: core.setSecret }
++
+ class MiseIntegrityMismatchError extends Error {}
+ 
+ async function run(): Promise<void> {
+@@ -890,18 +900,31 @@ interface DownloadResponse {
+  * `--write-out`; wget through `--server-response`, which prints each
+  * response's status line to stderr. wget gets one try because the retry loop
+  * owns the policy. With `filePath` the body goes to that file (replacing any
+- * partial one), otherwise it is returned.
++ * partial one), otherwise it is returned. Credentials from a
++ * `MISE_URL_REPLACEMENTS` rewrite reach curl on stdin, never on the command
++ * line.
+  */
+ async function requestOnce(
+-  url: string,
++  target: DownloadTarget,
+   filePath?: string
+ ): Promise<DownloadResponse> {
++  const { url, credentials } = target
+   const tool = await getDownloadTool()
+-  const opts = { silent: true, ignoreReturnCode: true }
++  if (credentials && tool !== 'curl') {
++    throw new NonRetryableError(
++      'the replacement URL has credentials, which only curl can receive off the command line; install curl'
++    )
++  }
++  const opts = {
++    silent: true,
++    ignoreReturnCode: true,
++    ...(credentials ? { input: Buffer.from(curlUserConfig(credentials)) } : {})
++  }
+   if (tool === 'curl') {
+     const rsp = await exec.getExecOutput(
+       'curl',
+       [
++        ...(credentials ? ['-K', '-'] : []),
+         '-sSL',
+         '-w',
+         '\n%{http_code} %{url_effective}',
+@@ -945,34 +968,62 @@ async function requestOnce(
+   }
+ }
+ 
++function urlReplacements(): [string, string][] | undefined {
++  if (urlReplacementRules === null) {
++    urlReplacementRules = parseUrlReplacements(
++      process.env.MISE_URL_REPLACEMENTS,
++      urlReplacementLog
++    )
++  }
++  return urlReplacementRules
++}
++
++// The mirror gets one retry; then the original URL gets the full policy, so a
++// mirror outage costs seconds, not the minute of backoff.
++const MIRROR_RETRIES = 1
++
+ /**
+- * Download `url` with retries (see download-retry.ts) and return the body, or
+- * write it to `filePath` and return an empty string. With `notFoundOk`, an
+- * HTTP 404 returns undefined instead of failing.
++ * Download `url`, or its `MISE_URL_REPLACEMENTS` rewrite, with retries (see
++ * download-retry.ts) and return the body, or write it to `filePath` and return
++ * an empty string. With `notFoundOk`, an HTTP 404 from the original URL returns
++ * undefined instead of failing; a mirror that lacks the file says nothing about
++ * the release, so its 404 falls back to the original URL.
+  */
+ async function download(
+   url: string,
+   opts: { filePath?: string; notFoundOk?: boolean } = {}
+ ): Promise<string | undefined> {
+-  return retryDownload(
+-    async () => {
+-      const rsp = await requestOnce(url, opts.filePath)
+-      if (opts.notFoundOk && rsp.status === 404) return undefined
+-      const ok =
+-        rsp.exitCode === 0 &&
+-        (rsp.status === undefined || (rsp.status >= 200 && rsp.status < 300))
+-      if (ok) return rsp.body
+-      if (opts.filePath) await io.rmRF(opts.filePath)
+-      throw downloadError({
+-        url,
+-        status: failedStatus(rsp.status, rsp.exitCode),
+-        host: rsp.host,
+-        tool: rsp.tool,
+-        exitCode: rsp.exitCode,
+-        localError: rsp.localError
+-      })
+-    },
+-    { onRetry: core.warning }
++  return withUrlReplacements(
++    url,
++    urlReplacements(),
++    async (target, mirrored) =>
++      retryDownload(
++        async () => {
++          const rsp = await requestOnce(target, opts.filePath)
++          if (opts.notFoundOk && !mirrored && rsp.status === 404) {
++            return undefined
++          }
++          const ok =
++            rsp.exitCode === 0 &&
++            (rsp.status === undefined ||
++              (rsp.status >= 200 && rsp.status < 300))
++          if (ok) return rsp.body
++          if (opts.filePath) await io.rmRF(opts.filePath)
++          throw downloadError({
++            url: target.url,
++            status: failedStatus(rsp.status, rsp.exitCode),
++            host: rsp.host,
++            tool: rsp.tool,
++            exitCode: rsp.exitCode,
++            localError: rsp.localError
++          })
++        },
++        {
++          onRetry: core.warning,
++          ...(mirrored ? { retries: MIRROR_RETRIES } : {})
++        }
++      ),
++    urlReplacementLog
+   )
+ }
+ 
+diff --git a/src/url-replacements.ts b/src/url-replacements.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..49c60b35439b97a7b2fd88b2daeea85b3f3d05ff
+--- /dev/null
++++ b/src/url-replacements.ts
+@@ -0,0 +1,123 @@
++/**
++ * Apply mise's `url_replacements` rules, read from `MISE_URL_REPLACEMENTS`, to
++ * the action's own downloads, so mise itself comes from the same mirror that
++ * mise later uses for tools.
++ */
++
++/** A URL to fetch, with any `user:password` taken out of it. */
++export interface DownloadTarget {
++  url: string
++  credentials?: string
++}
++
++export interface UrlReplacementLog {
++  warning(message: string): void
++  setSecret(secret: string): void
++}
++
++/**
++ * The rules in `MISE_URL_REPLACEMENTS`, in order, or undefined when it is
++ * unset. A value that is not a JSON object of strings is ignored with a
++ * warning, so a bad setting never blocks the download from GitHub.
++ */
++export function parseUrlReplacements(
++  json: string | undefined,
++  log: Pick<UrlReplacementLog, 'warning'>
++): [string, string][] | undefined {
++  if (!json) return undefined
++  let rules: unknown
++  try {
++    rules = JSON.parse(json)
++  } catch (err) {
++    const reason = err instanceof Error ? err.message : String(err)
++    log.warning(`Ignoring MISE_URL_REPLACEMENTS: not valid JSON (${reason})`)
++    return undefined
++  }
++  if (
++    typeof rules !== 'object' ||
++    rules === null ||
++    Array.isArray(rules) ||
++    !Object.values(rules).every(v => typeof v === 'string')
++  ) {
++    log.warning(
++      'Ignoring MISE_URL_REPLACEMENTS: expected a JSON object of string replacements'
++    )
++    return undefined
++  }
++  return Object.entries(rules as Record<string, string>)
++}
++
++/**
++ * Rewrite `url` as mise does: rules apply in order, a plain key replaces every
++ * occurrence anywhere in the URL, and the first rule that turns the URL into a
++ * different valid URL wins. `regex:` rules are skipped; the action only
++ * supports plain keys.
++ */
++export function replaceUrl(url: string, rules: [string, string][]): string {
++  for (const [pattern, replacement] of rules) {
++    if (pattern.startsWith('regex:') || !url.includes(pattern)) continue
++    const replaced = url.split(pattern).join(replacement)
++    if (replaced !== url && URL.canParse(replaced)) return replaced
++  }
++  return url
++}
++
++/** Take the userinfo out of `url`, so it never reaches a command line or log. */
++export function downloadTarget(url: string): DownloadTarget {
++  const parsed = new URL(url)
++  if (!parsed.username && !parsed.password) return { url }
++  const credentials = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`
++  parsed.username = ''
++  parsed.password = ''
++  return { url: parsed.toString(), credentials }
++}
++
++/** A curl config, read with `curl -K -`, that passes `credentials` on stdin. */
++export function curlUserConfig(credentials: string): string {
++  const quoted = credentials
++    .replace(/\\/g, '\\\\')
++    .replace(/"/g, '\\"')
++    .replace(/\r/g, '\\r')
++    .replace(/\n/g, '\\n')
++  return `user = "${quoted}"\n`
++}
++
++/**
++ * Fetch `url` through the first matching rule. When that fails, warn and fetch
++ * the original URL instead, so a mirror outage never fails the run. `fetch`
++ * gets `mirrored` so it can treat a missing file on the mirror as a failure.
++ */
++export async function withUrlReplacements<T>(
++  url: string,
++  rules: [string, string][] | undefined,
++  fetch: (target: DownloadTarget, mirrored: boolean) => Promise<T>,
++  log: UrlReplacementLog
++): Promise<T> {
++  const replaced = rules ? replaceUrl(url, rules) : url
++  if (replaced === url) return fetch({ url }, false)
++  const target = downloadTarget(replaced)
++  try {
++    if (target.credentials) {
++      log.setSecret(target.credentials)
++      // A token passed as the user name alone has an empty password.
++      const sep = target.credentials.indexOf(':')
++      log.setSecret(
++        target.credentials.slice(sep + 1) || target.credentials.slice(0, sep)
++      )
++      // mise refuses the same downgrade.
++      if (
++        new URL(url).protocol === 'https:' &&
++        new URL(target.url).protocol === 'http:'
++      ) {
++        throw new Error('refusing to send credentials over plain HTTP')
++      }
++    }
++    return await fetch(target, true)
++  } catch (err) {
++    const reason = err instanceof Error ? err.message : String(err)
++    log.warning(
++      `Could not download ${target.url} through MISE_URL_REPLACEMENTS: ${reason}. Falling back to ${url}.`
++    )
++    return fetch({ url }, false)
++  }
++}
