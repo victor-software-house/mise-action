@@ -1,3 +1,19 @@
+# VSH fork of jdx/mise-action
+
+This fork carries the downstream patches listed in [PATCHES.md](PATCHES.md) on
+the `downstream` branch, managed with forkctl. The patches sit on an upstream
+release tag, and `patches/fork.yaml` records which one.
+
+Each published head gets an annotated tag named after the upstream base with
+one more number: `v5.2.5.1` is upstream `v5.2.5` plus the patches. A later
+upstream base takes its own number with `.1`, such as `v5.3.0.1`, and a second
+patch release on the same base takes `.2`. Pin the commit and name the tag in
+a comment:
+
+```yaml
+- uses: victor-software-house/mise-action@<commit SHA> # v5.2.5.1
+```
+
 # Example Workflow
 
 ```yaml

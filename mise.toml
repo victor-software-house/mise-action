@@ -17,3 +17,11 @@ hk = { version = 'latest', minimum_release_age = '0s' }
 pkl = 'latest'
 jactionlint = 'latest'
 oxfmt = 'latest'
+
+[env]
+FORKCTL_MANIFEST = "patches/fork.yaml"
+
+[task_config]
+includes = [
+  "git::https://github.com/victor-software-house/forkctl.git//tasks/fork?ref=v0.0.48",
+]
