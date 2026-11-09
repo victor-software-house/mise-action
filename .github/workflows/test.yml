@@ -489,6 +489,43 @@ jobs:
         shell: bash
         run: test "$(cat "$MISE_ACTION_CURL_ATTEMPTS")" = 3
 
+  url_replacements:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record curl command lines
+        shell: bash
+        run: |
+          real_curl="$(command -v curl)"
+          mock_bin="$RUNNER_TEMP/mock-bin"
+          mkdir -p "$mock_bin"
+          cat > "$mock_bin/curl" <<EOF
+          #!/usr/bin/env bash
+          printf '%s\n' "\$*" >> "\$MISE_ACTION_CURL_LOG"
+          exec "$real_curl" "\$@"
+          EOF
+          chmod +x "$mock_bin/curl"
+          echo "$mock_bin" >> "$GITHUB_PATH"
+          echo "MISE_ACTION_CURL_LOG=$RUNNER_TEMP/curl-log" >> "$GITHUB_ENV"
+      - name: Setup mise through an unreachable mirror
+        uses: $/
+        env:
+          MISE_URL_REPLACEMENTS: '{"https://github.com/": "https://ci:url-replacements-test-secret@mirror.invalid/github/"}'
+        with:
+          cache: false
+          install: false
+          mise_dir: ${{ runner.temp }}/mise-url-replacements
+          version: 2026.11.5
+      - run: mise --version
+      - name: Check the mirror was tried without credentials on the command line
+        shell: bash
+        run: |
+          grep -q 'https://mirror.invalid/github/jdx/mise/releases/download/v2026.11.5/' "$MISE_ACTION_CURL_LOG"
+          ! grep -q 'url-replacements-test-secret' "$MISE_ACTION_CURL_LOG"
+
   test-typescript:
     timeout-minutes: 10
     name: TypeScript Tests
