@@ -1,0 +1,57 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/jdx/mise-action.git
+  fetch_ref: refs/heads/main
+base:
+  target:
+    kind: tag
+    selector: refs/tags/v5.2.5
+    commit: 6612f0ef07ed2a736cd1e00a94a065522dd41195
+  canonical: 6612f0ef07ed2a736cd1e00a94a065522dd41195
+  stack: 6612f0ef07ed2a736cd1e00a94a065522dd41195
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: mise-download-url-replacements
+    kind: source
+    purpose: >-
+      Download mise, its signed checksums and its packslip through the
+      MISE_URL_REPLACEMENTS rules that mise itself honors, so CI fetches everything through one
+      mirror. Credentials in a rewritten URL reach curl on stdin, never argv, and a failed
+      mirror download falls back to the original URL.
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream jdx/mise-action applies MISE_URL_REPLACEMENTS to its own downloads
+      with credentials kept off the command line.
+    scope:
+      - src/index.ts
+      - src/url-replacements.ts
+      - scripts/url-replacements.test.mjs
+      - README.md
+      - .github/workflows/test.yml
+      - dist/**
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []
